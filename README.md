@@ -9,6 +9,7 @@ smo-monolith/
 ├── be-fastapi-smo/            # Backend API (FastAPI, Python 3.11)
 ├── fe-react-smo/              # Frontend (React 18, Tailwind CSS)
 ├── auto-matching-service/     # AI Matching Engine (FastAPI + Next.js)
+├── .github/workflows/         # CI/CD pipeline
 ├── Dockerfile                 # Combined container for Cloud Run
 ├── nginx.conf                 # Reverse proxy config
 └── start.py                   # Container startup script
@@ -16,21 +17,76 @@ smo-monolith/
 
 **Production** runs on Google App Engine (backend + frontend as separate services) with Cloud SQL (PostgreSQL).
 
-**Test environment** runs as a single Cloud Run container with nginx reverse-proxying to uvicorn — no CORS needed, one URL, scale-to-zero.
+**Test environment** runs as a single Cloud Run container with nginx reverse-proxying to both backend services — no CORS needed, one URL, scale-to-zero.
 
 ```
-┌─────────────────────────────────────────────────┐
-│              Cloud Run Container                 │
-│                                                  │
-│   ┌─────────┐        ┌──────────────────┐       │
-│   │  nginx   │──/api/→│    uvicorn       │       │
-│   │  :8080   │        │    :8000         │       │
-│   │          │        │  (FastAPI app)   │       │
-│   │ static   │        │                  │       │
-│   │ files    │        │    Cloud SQL     │       │
-│   │ (React)  │        │    (smo_test)    │       │
-│   └─────────┘        └──────────────────┘       │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                  Cloud Run Container                      │
+│                                                           │
+│   ┌──────────┐       ┌─────────────────────┐             │
+│   │  nginx    │─/api/→│  uvicorn (SMO)      │             │
+│   │  :8080    │       │  :8000              │             │
+│   │           │       │  FastAPI backend    │─────┐       │
+│   │  static   │       │  (34 routers)       │     │       │
+│   │  files    │       └─────────────────────┘     │       │
+│   │  (React)  │                                   │       │
+│   └──────────┘       ┌─────────────────────┐     │       │
+│                       │  uvicorn (Matching) │◀────┘       │
+│                       │  :8002              │  proxy      │
+│                       │  AI matching engine │  /matching  │
+│                       └─────────────────────┘             │
+│                                                           │
+│                       Cloud SQL (smo_test)                │
+└──────────────────────────────────────────────────────────┘
+```
+
+Request flow for AI matching: `Frontend → nginx → SMO backend /api/v1/matching/* → proxy to localhost:8002 → auto-matching-service`
+
+---
+
+## CI/CD Pipeline
+
+Automated deployment via GitHub Actions. Every push to `main` builds and deploys to Cloud Run.
+
+```
+Push to main → GitHub Actions → Docker Build → Artifact Registry → Cloud Run
+```
+
+**Workflow:** `.github/workflows/deploy-cloud-run.yml`
+
+| Step | Detail |
+|------|--------|
+| Checkout | Clones monolith + all submodules (uses `SUBMODULE_PAT` for cross-org access) |
+| GCP Auth | Workload Identity Federation (keyless, no service account keys) |
+| Build | Multi-stage Docker build: React frontend → Python + nginx runtime |
+| Push | Image tagged with commit SHA + `latest` to Artifact Registry |
+| Deploy | Rolling update to Cloud Run with zero-downtime |
+
+**Build time:** ~3.5 minutes end-to-end.
+
+### GitHub Secrets Required
+
+| Secret | Description |
+|--------|-------------|
+| `WIF_PROVIDER` | Workload Identity Federation provider path |
+| `WIF_SERVICE_ACCOUNT` | GCP service account for deployment |
+| `SUBMODULE_PAT` | GitHub classic PAT with `repo` scope (for cross-org submodule access) |
+
+### GCP Infrastructure
+
+| Resource | Detail |
+|----------|--------|
+| Service Account | `github-actions-deploy@student-marketing-operations.iam.gserviceaccount.com` |
+| WIF Pool | `github-actions-pool` → `github-actions-provider` (OIDC) |
+| Artifact Registry | `asia-south1-docker.pkg.dev/student-marketing-operations/smo-test/smo-test` |
+| Cloud Run | `smo-test` in `asia-south1` |
+
+### One-time Setup
+
+The WIF setup script creates the GCP service account, IAM roles, and Workload Identity Federation:
+
+```bash
+bash .github/setup-wif.sh
 ```
 
 ---
@@ -50,6 +106,7 @@ FastAPI application with 34 API routers mounted at `/api/v1/`. Handles all busin
 - Talent Hub — public-facing candidate profiles for clients
 - Digital Spaces — content management
 - Resume parsing and semantic search (OpenAI embeddings + pgvector)
+- AI Matching proxy — forwards `/api/v1/matching/*` to auto-matching-service
 - Google Drive integration for document management
 - Apify integration for job scraping
 - Mailgun for transactional emails
@@ -84,7 +141,7 @@ React 18 single-page application with Tailwind CSS.
 
 ### auto-matching-service — AI Matching Engine
 
-3-layer AI-powered candidate-job matching pipeline with its own backend and frontend.
+3-layer AI-powered candidate-job matching pipeline with its own backend and frontend. Runs as a sidecar process on port 8002 inside the Cloud Run container; the SMO backend proxies requests to it.
 
 **Matching pipeline:**
 
@@ -199,6 +256,7 @@ npm run dev
 | `SHARED_DRIVE_ID` | No | Google Shared Drive ID |
 | `ENABLE_SEMANTIC_SEARCH` | No | `True` to enable vector search |
 | `FRONTEND_URL` | No | Frontend origin (default: `https://app.wynisco.com`) |
+| `AUTO_MATCHING_SERVICE_URL` | No | Matching service URL (default: `http://localhost:8002`) |
 
 **auto-matching-service:**
 | Variable | Required | Description |
@@ -229,22 +287,36 @@ gcloud app deploy
 
 ### Test Environment (Cloud Run)
 
-Single container combining nginx (React static files) + uvicorn (FastAPI) on Cloud Run.
+Single container combining nginx + SMO backend + auto-matching-service on Cloud Run. Deploys automatically on push to `main` via CI/CD.
 
-**URL:** `https://smo-test-101215158180.asia-south1.run.app`
+**URL:** `https://smo-test-seek2wfd4q-el.a.run.app`
 
-**Build and deploy:**
+**Automatic deployment:**
+```bash
+# Just push to main — CI/CD handles the rest
+git push origin main
+```
+
+**Manual deployment (if needed):**
 ```bash
 # From monolith root
 gcloud builds submit --tag asia-south1-docker.pkg.dev/student-marketing-operations/smo-test/smo-test:latest
 gcloud run deploy smo-test --image asia-south1-docker.pkg.dev/student-marketing-operations/smo-test/smo-test:latest --region asia-south1
 ```
 
+**Container internals:**
+
+| Process | Port | Role |
+|---------|------|------|
+| nginx | 8080 | Serves React static files, proxies `/api/*` to SMO backend |
+| uvicorn (SMO) | 8000 | FastAPI backend — 34 routers + matching proxy |
+| uvicorn (Matching) | 8002 | Auto-matching-service — AI scoring engine |
+
 **Configuration:**
 - 2 CPU, 2 GiB RAM, scale 0–3 instances
 - `--no-cpu-throttling` required (Python imports take 30s+ with throttled CPU)
 - Cloud SQL socket connection via `--add-cloudsql-instances`
-- Secrets injected from GCP Secret Manager
+- Secrets injected from GCP Secret Manager (`OPENAI_API_KEY`, `CEREBRAS_API_KEY`, `APIFY_API_TOKEN`, `GOOGLE_DRIVE_CREDENTIALS_JSON`)
 - Mailgun intentionally omitted to prevent test emails
 
 **Teardown:**
@@ -293,7 +365,7 @@ git push                             # push to submodule remote
 cd ..                                # back to monolith
 git add be-fastapi-smo               # update pointer
 git commit -m "Update be-fastapi-smo"
-git push                             # push monolith
+git push                             # push monolith → triggers CI/CD deploy
 ```
 
 **Pulling latest:**
@@ -308,7 +380,7 @@ git add be-fastapi-smo fe-react-smo auto-matching-service
 git commit -m "Update all submodules to latest"
 ```
 
-**Golden rule:** Always push the submodule first, then the monolith.
+**Golden rule:** Always push the submodule first, then the monolith. Pushing the monolith triggers CI/CD.
 
 ---
 
@@ -318,6 +390,8 @@ git commit -m "Update all submodules to latest"
 - asyncpg doesn't support `::vector` cast — use `CAST(:param AS vector)` instead
 - OpenAI batch embedding limit ~300K tokens — `EMBEDDING_BATCH_SIZE=256` works safely
 - Cloud Run test env requires `--no-cpu-throttling` due to heavy Python import times on cold start
+- Auto-matching-service runs as a sidecar in the Cloud Run container; SMO backend proxies to it via `localhost:8002`
+- Submodule URLs use HTTPS (not SSH) in `.gitmodules` so CI/CD token auth works
 
 ---
 
@@ -327,7 +401,7 @@ git commit -m "Update all submodules to latest"
 smo-monolith/
 ├── be-fastapi-smo/                 # Backend submodule
 │   ├── app/
-│   │   ├── api/v1/                 # 34 route handlers
+│   │   ├── api/v1/                 # 34 route handlers (+matching proxy)
 │   │   ├── crud/                   # Database query logic
 │   │   ├── models/                 # 31 SQLAlchemy models
 │   │   ├── schemas/                # Pydantic request/response schemas
@@ -340,9 +414,9 @@ smo-monolith/
 │
 ├── fe-react-smo/                   # Frontend submodule
 │   ├── src/
-│   │   ├── pages/                  # Route pages
+│   │   ├── pages/                  # Route pages (incl. AIMatching/)
 │   │   ├── components/             # Reusable UI components
-│   │   ├── services/               # API client modules
+│   │   ├── services/               # API client modules (incl. MatchingService.js)
 │   │   └── context/                # React context providers
 │   ├── e2e/                        # Playwright E2E tests
 │   └── app.yaml                    # App Engine production config
@@ -356,10 +430,15 @@ smo-monolith/
 │   ├── frontend/                   # Next.js 16 dashboard
 │   └── scripts/                    # Job scraping and re-embedding utilities
 │
-├── Dockerfile                      # Combined Cloud Run container
+├── .github/
+│   ├── workflows/
+│   │   └── deploy-cloud-run.yml    # CI/CD: build + deploy on push to main
+│   └── setup-wif.sh               # One-time GCP Workload Identity setup
+│
+├── Dockerfile                      # Combined Cloud Run container (3 services)
 ├── nginx.conf                      # nginx reverse proxy config
-├── start.py                        # Container startup (nginx + uvicorn)
-├── .gcloudignore                   # Cloud Build upload filter
+├── start.py                        # Container startup (nginx + 2 uvicorn processes)
 ├── .dockerignore                   # Docker build context filter
+├── .gcloudignore                   # Cloud Build upload filter
 └── CLAUDE.md                       # AI assistant project context
 ```
