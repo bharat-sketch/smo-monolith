@@ -1,0 +1,23 @@
+# Ignore everything first
+*
+
+# Only include what the Dockerfile needs
+!be-fastapi-smo/
+!fe-react-smo/
+!nginx.conf
+!supervisord.conf
+!start.sh
+!start.py
+!Dockerfile
+
+# Exclude heavy/unnecessary stuff within included dirs
+**/.git
+**/.gitignore
+**/.env
+**/node_modules
+**/venv
+**/__pycache__
+**/*.pyc
+**/.vscode
+**/.idea
+**/.claude
