@@ -61,6 +61,7 @@ jobs:
             --max-instances=3
             --add-cloudsql-instances=student-marketing-operations:asia-south1:smo
             --service-account=student-marketing-operations@appspot.gserviceaccount.com
+            --update-secrets=CEREBRAS_API_KEY=smo-cerebras-api-key:latest
 
       - name: Output URL
         run: echo "Deployed to $(gcloud run services describe ${{ env.SERVICE }} --region ${{ env.REGION }} --format='value(status.url)')"

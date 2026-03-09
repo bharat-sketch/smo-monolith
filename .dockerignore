@@ -4,6 +4,7 @@
 # Only include what the Dockerfile needs
 !be-fastapi-smo/
 !fe-react-smo/
+!auto-matching-service/
 !nginx.conf
 !supervisord.conf
 !start.sh
