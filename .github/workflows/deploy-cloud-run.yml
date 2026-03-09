@@ -21,13 +21,11 @@ jobs:
       id-token: write
 
     steps:
-      - name: Checkout monolith
+      - name: Checkout with submodules
         uses: actions/checkout@v4
-
-      - name: Checkout submodules (cross-org)
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.SUBMODULE_PAT }}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth=1 be-fastapi-smo fe-react-smo
+        with:
+          token: ${{ secrets.SUBMODULE_PAT }}
+          submodules: recursive
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
