@@ -1,9 +1,9 @@
 [submodule "be-fastapi-smo"]
 	path = be-fastapi-smo
-	url = git@github-bharat:Wynisco-Engineering/be-fastapi-smo.git
+	url = https://github.com/Wynisco-Engineering/be-fastapi-smo.git
 [submodule "fe-react-smo"]
 	path = fe-react-smo
-	url = git@github.com:Wynisco-Engineering/fe-react-smo.git
+	url = https://github.com/Wynisco-Engineering/fe-react-smo.git
 [submodule "auto-matching-service"]
 	path = auto-matching-service
-	url = git@github.com:bharat-sketch/auto-matching-service.git
+	url = https://github.com/bharat-sketch/auto-matching-service.git
