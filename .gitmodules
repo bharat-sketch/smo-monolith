@@ -4,6 +4,3 @@
 [submodule "fe-react-smo"]
 	path = fe-react-smo
 	url = https://github.com/Wynisco-Engineering/fe-react-smo.git
-[submodule "auto-matching-service"]
-	path = auto-matching-service
-	url = https://github.com/bharat-sketch/auto-matching-service.git

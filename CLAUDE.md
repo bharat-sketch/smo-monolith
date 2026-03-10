@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Wynisco SMO (Student Marketing Operations) — a recruiting/talent management platform. Three services share a PostgreSQL database, deployed together in a single Cloud Run container for the test environment, and separately on Google App Engine for production.
+Wynisco SMO (Student Marketing Operations) — a recruiting/talent management platform. Two services share a PostgreSQL database, deployed together in a single Cloud Run container for the test environment, and separately on Google App Engine for production.
 
 This is a **git monolith with submodules**:
 - `be-fastapi-smo/` → `Wynisco-Engineering/be-fastapi-smo`
 - `fe-react-smo/` → `Wynisco-Engineering/fe-react-smo`
-- `auto-matching-service/` → `bharat-sketch/auto-matching-service`
+- `auto-matching-service/` → `bharat-sketch/auto-matching-service` (legacy — matching is now integrated into be-fastapi-smo under `app/matching/`)
 
 **Always push the submodule first, then the monolith.** Pushing the monolith to `main` triggers CI/CD deployment.
 
@@ -37,15 +37,6 @@ npm run build           # production build
 npm run test:e2e        # Playwright E2E tests (e2e/ directory)
 ```
 
-### auto-matching-service (port 8002)
-
-```bash
-cd auto-matching-service
-pip install -r requirements.txt
-alembic upgrade head                              # separate version table: alembic_version_auto_matcher
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
-```
-
 ### auto-matching-service/frontend (port 3001)
 
 ```bash
@@ -70,14 +61,13 @@ gcloud run deploy smo-test --image asia-south1-docker.pkg.dev/student-marketing-
 
 ### Cloud Run Container (Test Environment)
 
-Single container runs three processes via `start.py`:
+Single container runs two processes via `start.py`:
 - **nginx** (:8080) — serves React static files, proxies `/api/*` to uvicorn
-- **uvicorn SMO** (:8000) — FastAPI backend with 34 routers
-- **uvicorn matching** (:8002) — auto-matching-service AI engine
+- **uvicorn SMO** (:8000) — FastAPI backend with 34 routers (matching integrated)
 
 No CORS needed — frontend and backend share the same origin via nginx.
 
-Request flow for AI matching: `Frontend → nginx → SMO /api/v1/matching/* → httpx proxy to localhost:8002 → auto-matching-service`
+Request flow for AI matching: `Frontend → nginx → SMO /api/v1/matching/*` (direct, no proxy)
 
 ### be-fastapi-smo — Layered Pattern
 
@@ -90,6 +80,15 @@ All routes mounted at `/api/v1/{resource}` in `app/main.py`. Layered:
 - **`app/schemas/`** — Pydantic v2 request/response schemas
 - **`app/core/`** — Config (`config.py`), async DB engine (`database.py`), JWT auth (`auth_utils.py`), rate limiter (`limiter.py`)
 - **`app/utils/`** — Integrations (Google Drive, GCS, Apify, OpenAI, Mailgun)
+- **`app/matching/`** — AI matching engine (formerly auto-matching-service)
+  - `services/matching_engine.py` — Orchestrator: Hard Filter → Semantic ANN → LLM Score
+  - `services/embedding_service.py` — OpenAI text-embedding-3-large embeddings
+  - `services/llm_scorer.py` — Cerebras gpt-oss-120b LLM scoring
+  - `services/cerebras_client.py` — Cerebras API client
+  - `services/semantic_scorer.py` — pgvector cosine similarity
+  - `services/hard_filter.py` — SQL-based candidate/job elimination
+  - `services/why_card.py` — Score breakdown builder
+  - `redis_client.py` — Async Redis cache with graceful fallback
 
 **Auth dependencies** (`app/api/deps.py`):
 - `get_current_user` — base auth, blocks alumni role
@@ -109,7 +108,7 @@ async def get_db():
 ```
 Pool: `pool_size=8`, `max_overflow=4`, `pool_recycle=1800`, `pool_pre_ping=True`.
 
-**Matching proxy** (`app/api/v1/matching.py`): Forwards `/api/v1/matching/*` to `AUTO_MATCHING_SERVICE_URL` (default `http://localhost:8002`) via httpx. All authenticated users can access it.
+**Matching routes** (`app/api/v1/matching.py`): Direct route handlers for `/api/v1/matching/*` — match, dismiss, embeddings backfill, and candidate/job listing. All authenticated users can access matching; embeddings backfill requires admin.
 
 ### fe-react-smo
 
@@ -120,15 +119,17 @@ React 18 CRA app (react-scripts). **JavaScript, no TypeScript.**
 - `src/components/` — Reusable UI components (Sidebar, Header, ProtectedRoute, ClientProtectedRoute)
 - `src/context/` — React context providers (UserContext for role-based rendering)
 
-### auto-matching-service — 3-Layer Pipeline
+### Matching Engine (app/matching/) — 2-Layer Pipeline
 
-1. **Filter** — SQL-based elimination (employer blocklist, job recency, experience)
-2. **Semantic** — pgvector cosine similarity on OpenAI `text-embedding-3-small` vectors
+Integrated into be-fastapi-smo (formerly standalone auto-matching-service).
+
+1. **Hard Filter** — SQL-based elimination (employer blocklist, job recency, experience)
+2. **Semantic** — pgvector cosine similarity on OpenAI `text-embedding-3-large` vectors
 3. **LLM** — Cerebras `gpt-oss-120b` scoring with structured prompts
 
-Key services: `embedding_service.py`, `semantic_scorer.py`, `rule_scorer.py`, `llm_scorer.py`, `matching_engine.py`
+Key services under `be-fastapi-smo/app/matching/services/`: `matching_engine.py`, `embedding_service.py`, `semantic_scorer.py`, `llm_scorer.py`, `cerebras_client.py`, `hard_filter.py`, `why_card.py`
 
-Uses `app/models/readonly.py` for read-only mapped classes of shared SMO tables. Separate Alembic version table (`alembic_version_auto_matcher`) to avoid migration conflicts.
+Uses the same SMO models directly (no readonly copies). Redis caching for LLM results with graceful fallback.
 
 ## Conventions
 
@@ -151,9 +152,7 @@ Uses `app/models/readonly.py` for read-only mapped classes of shared SMO tables.
 
 ## Environment Variables
 
-**be-fastapi-smo**: `DATABASE_URL` (required, `postgresql+asyncpg://...`), `OPENAI_API_KEY`, `APIFY_API_TOKEN`, `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, `GOOGLE_DRIVE_CREDENTIALS_JSON`, `SHARED_DRIVE_ID`, `ENABLE_SEMANTIC_SEARCH`, `FRONTEND_URL`, `AUTO_MATCHING_SERVICE_URL`
-
-**auto-matching-service**: `DATABASE_URL` (required), `OPENAI_API_KEY` (required), `CEREBRAS_API_KEY` (required), `REDIS_URL` (optional, falls back to DB-only cache)
+**be-fastapi-smo**: `DATABASE_URL` (required, `postgresql+asyncpg://...`), `OPENAI_API_KEY`, `APIFY_API_TOKEN`, `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, `GOOGLE_DRIVE_CREDENTIALS_JSON`, `SHARED_DRIVE_ID`, `ENABLE_SEMANTIC_SEARCH`, `FRONTEND_URL`, `CEREBRAS_API_KEY` (for matching LLM scoring), `REDIS_URL` (optional, matching LLM cache)
 
 ## Deployment
 

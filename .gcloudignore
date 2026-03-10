@@ -9,7 +9,6 @@ __pycache__/
 .idea/
 .claude/
 matching-service/
-auto-matching-service/
 diagrams/
 *.docx
 *.pptx

@@ -11,3 +11,4 @@ venv/
 *.docx
 *.pptx
 .claude/
+custom-embedding/

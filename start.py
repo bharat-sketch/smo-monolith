@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Startup script for combined nginx + SMO backend + auto-matching-service on Cloud Run.
+"""Startup script for combined nginx + SMO backend on Cloud Run.
 
-Runs nginx and auto-matching-service in the background,
-SMO backend in the foreground so Cloud Run captures its logs.
+Runs nginx in the background, SMO backend in the foreground
+so Cloud Run captures its logs.
 """
 import subprocess
 import sys
@@ -10,14 +10,6 @@ import os
 
 # Start nginx in background
 subprocess.Popen(["nginx", "-g", "daemon off;"], stdout=sys.stdout, stderr=sys.stderr)
-
-# Start auto-matching-service in background (port 8002)
-subprocess.Popen(
-    ["uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8002", "--log-level", "info"],
-    cwd="/app/auto-matching",
-    stdout=sys.stdout,
-    stderr=sys.stderr,
-)
 
 # Start SMO backend in the foreground (port 8000) — replaces this process
 os.chdir("/app/smo")
