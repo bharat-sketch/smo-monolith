@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Wynisco — a recruiting/talent management platform with four independent services sharing a PostgreSQL database (`smo_local`):
+Wynisco SMO (Student Marketing Operations) — a recruiting/talent management platform. Three services share a PostgreSQL database, deployed together in a single Cloud Run container for the test environment, and separately on Google App Engine for production.
 
-1. **be-fastapi-smo/** — Core SMO (Student Marketing Operations) backend. Manages jobs, candidates, applications, interviews, pods (cohorts), employers, attendance tracking, and more. Deployed on Google App Engine.
-2. **fe-react-smo/** — React 18 + Tailwind CSS frontend for SMO. Uses react-router-dom, Axios, context-based state management. Deployed on Google App Engine.
-3. **matching-service/** — AI-powered candidate-job matching engine with analytics dashboard. Backend uses Cerebras LLM for scoring; frontend is Next.js 16 + React 19. Deployed on Railway.
-4. **auto-matching-service/** — Automated 3-layer matching engine (semantic embeddings + rule scoring + LLM scoring) with Redis caching. Has its own Next.js 16 frontend. Separate git repo.
+This is a **git monolith with submodules**:
+- `be-fastapi-smo/` → `Wynisco-Engineering/be-fastapi-smo`
+- `fe-react-smo/` → `Wynisco-Engineering/fe-react-smo`
+- `auto-matching-service/` → `bharat-sketch/auto-matching-service`
 
-Each service directory is its own git repository. The parent directory is **not** a git repo.
+**Always push the submodule first, then the monolith.** Pushing the monolith to `main` triggers CI/CD deployment.
 
 ## Commands
 
@@ -23,10 +23,8 @@ pip install -r requirements.txt
 alembic upgrade head                              # run migrations
 alembic revision --autogenerate -m "description"  # create migration
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-flake8                                            # lint
-mypy app                                          # type check
-pytest app/tests/                                 # tests (currently empty)
-gcloud app deploy                                 # deploy
+TEST_BASE_URL=http://localhost:8000 TEST_EMAIL=you@wynisco.com TEST_PASSWORD=pass pytest tests/ -v
+pytest tests/test_health.py -v                    # single test file
 ```
 
 ### fe-react-smo (port 3000)
@@ -37,25 +35,6 @@ npm install
 npm run start           # dev server
 npm run build           # production build
 npm run test:e2e        # Playwright E2E tests (e2e/ directory)
-gcloud app deploy       # deploy (run npm run build first)
-```
-
-### matching-service/backend (port 8001)
-
-```bash
-cd matching-service/backend
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
-# Deploy: railway up backend/ --path-as-root --service resume-matcher
-```
-
-### matching-service/frontend (port 3000)
-
-```bash
-cd matching-service/frontend
-npm install
-NEXT_PUBLIC_API_URL=http://localhost:8001 npm run dev
-# Deploy: railway up frontend/ --path-as-root --service frontend
 ```
 
 ### auto-matching-service (port 8002)
@@ -63,102 +42,125 @@ NEXT_PUBLIC_API_URL=http://localhost:8001 npm run dev
 ```bash
 cd auto-matching-service
 pip install -r requirements.txt
-alembic upgrade head
+alembic upgrade head                              # separate version table: alembic_version_auto_matcher
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8002
 ```
-
-Uses a separate Alembic version table (`alembic_version_auto_matcher`) to avoid conflicts with SMO migrations.
 
 ### auto-matching-service/frontend (port 3001)
 
 ```bash
 cd auto-matching-service/frontend
 npm install
-npm run dev             # Next.js dev on port 3001
-npm run lint            # ESLint
+npm run dev             # Next.js dev — proxies /api/* to localhost:8002
+npm run lint
 ```
 
-Next.js proxy: `next.config.ts` rewrites `/api/*` to `localhost:8002/api/*`, so the frontend API client uses relative URLs.
+### CI/CD Deployment
+
+```bash
+# Automatic: push to main triggers GitHub Actions → Cloud Run
+git push origin main
+
+# Manual:
+gcloud builds submit --tag asia-south1-docker.pkg.dev/student-marketing-operations/smo-test/smo-test:latest
+gcloud run deploy smo-test --image asia-south1-docker.pkg.dev/student-marketing-operations/smo-test/smo-test:latest --region asia-south1
+```
 
 ## Architecture
 
-### be-fastapi-smo
+### Cloud Run Container (Test Environment)
 
-FastAPI app with 34 routers, all mounted at `/api/v1/`. Layered pattern:
+Single container runs three processes via `start.py`:
+- **nginx** (:8080) — serves React static files, proxies `/api/*` to uvicorn
+- **uvicorn SMO** (:8000) — FastAPI backend with 34 routers
+- **uvicorn matching** (:8002) — auto-matching-service AI engine
 
-- **`app/api/v1/`** — Route handlers (one file per resource)
+No CORS needed — frontend and backend share the same origin via nginx.
+
+Request flow for AI matching: `Frontend → nginx → SMO /api/v1/matching/* → httpx proxy to localhost:8002 → auto-matching-service`
+
+### be-fastapi-smo — Layered Pattern
+
+All routes mounted at `/api/v1/{resource}` in `app/main.py`. Layered:
+
+- **`app/api/v1/`** — Route handlers (one file per resource, 34 routers)
+- **`app/api/deps.py`** — Auth dependencies (see below)
 - **`app/crud/`** — Database query logic
-- **`app/models/`** — SQLAlchemy 2.0 async ORM models (32 models)
+- **`app/models/`** — SQLAlchemy 2.0 async ORM models
 - **`app/schemas/`** — Pydantic v2 request/response schemas
-- **`app/core/`** — Config (`config.py` via Pydantic Settings), async DB engine (`database.py`), JWT auth (`auth_utils.py`), rate limiter (`limiter.py`)
-- **`app/credentials/`** — Auth/authorization utilities
-- **`app/utils/`** — Integrations (Google Drive, GCS, Apify scraping, OpenAI, Mailgun, BigQuery)
-- **`alembic/`** — 44+ migration files
+- **`app/core/`** — Config (`config.py`), async DB engine (`database.py`), JWT auth (`auth_utils.py`), rate limiter (`limiter.py`)
+- **`app/utils/`** — Integrations (Google Drive, GCS, Apify, OpenAI, Mailgun)
 
-Key middleware in `main.py`: request logging with user context extraction, client role access blocking (clients restricted to `/api/v1/auth/` and `/api/v1/talent-hub/`), rate limiting via SlowAPI.
+**Auth dependencies** (`app/api/deps.py`):
+- `get_current_user` — base auth, blocks alumni role
+- `get_current_admin_user` — requires `privilege` in `["admin", "superadmin"]`
+- `get_current_superadmin_user` — requires `superadmin` privilege only
+- `get_current_consultant_user` — requires consultant role or admin privilege
+- `get_current_client_user` — requires client role or superadmin privilege
+- `get_current_user_optional` — returns `None` if no token (for optional auth)
 
-User roles: candidate, instructor, consultant, alumni, admin, client.
+Note: `role` (candidate, consultant, instructor, alumni, client, counsellor, archive) is separate from `privilege` (user, admin, superadmin).
+
+**Database session pattern** (`app/core/database.py`):
+```python
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+Pool: `pool_size=8`, `max_overflow=4`, `pool_recycle=1800`, `pool_pre_ping=True`.
+
+**Matching proxy** (`app/api/v1/matching.py`): Forwards `/api/v1/matching/*` to `AUTO_MATCHING_SERVICE_URL` (default `http://localhost:8002`) via httpx. All authenticated users can access it.
 
 ### fe-react-smo
 
-React 18 CRA app (react-scripts). JavaScript, no TypeScript.
+React 18 CRA app (react-scripts). **JavaScript, no TypeScript.**
 
-- **`src/pages/`** — Route pages (jobs, pods, Employers, Interviews, Dashboard, etc.)
-- **`src/services/`** — API service modules (api.js base + per-resource services)
-- **`src/components/`** — Reusable UI components
-- **`src/context/`** — React context providers for shared state
+- `src/pages/` — Route pages including `AIMatching/`
+- `src/services/` — API client modules (`api.js` base + per-resource services including `MatchingService.js`)
+- `src/components/` — Reusable UI components (Sidebar, Header, ProtectedRoute, ClientProtectedRoute)
+- `src/context/` — React context providers (UserContext for role-based rendering)
 
-### matching-service/backend
+### auto-matching-service — 3-Layer Pipeline
 
-Smaller FastAPI app with 4 routers: candidates, jobs, matching, analytics. Uses read-only mapped classes for shared SMO database tables and a `match_results` cache table (24-hour TTL).
+1. **Filter** — SQL-based elimination (employer blocklist, job recency, experience)
+2. **Semantic** — pgvector cosine similarity on OpenAI `text-embedding-3-small` vectors
+3. **LLM** — Cerebras `gpt-oss-120b` scoring with structured prompts
 
-Matching pipeline: filter → structured pre-scoring (skills, experience, location, salary, visa) → LLM scoring via Cerebras (`gpt-oss-120b`) with async concurrency limits → cached results.
+Key services: `embedding_service.py`, `semantic_scorer.py`, `rule_scorer.py`, `llm_scorer.py`, `matching_engine.py`
 
-### matching-service/frontend
-
-Next.js 16 + React 19 + TypeScript. Uses shadcn/ui, Tailwind CSS, Recharts, React Query.
-
-### auto-matching-service
-
-FastAPI app with 3 routers: matching, embeddings, listing. 3-layer scoring engine:
-
-- **`app/services/embedding_service.py`** — OpenAI text-embedding-3-small, stored via pgvector
-- **`app/services/semantic_scorer.py`** — Cosine similarity on embeddings
-- **`app/services/rule_scorer.py`** — Structured pre-scoring (skills, experience, etc.)
-- **`app/services/llm_scorer.py`** — Cerebras LLM scoring with async concurrency
-- **`app/services/matching_engine.py`** — Orchestrates the 3-layer pipeline
-- **`app/models/readonly.py`** — Read-only mapped classes for shared SMO tables
-- **`app/core/redis_client.py`** — Optional Redis cache (falls back to DB-only)
-- **`scripts/`** — Job description scraping and re-embedding utilities
-
-### auto-matching-service/frontend
-
-Next.js 16 + React 19 + TypeScript. Uses shadcn/ui, Tailwind v4, Recharts, React Query. Auth: sessionStorage key `auto_matcher_auth`.
+Uses `app/models/readonly.py` for read-only mapped classes of shared SMO tables. Separate Alembic version table (`alembic_version_auto_matcher`) to avoid migration conflicts.
 
 ## Conventions
 
 - Python: snake_case functions/variables, PascalCase classes, type hints required
 - Imports grouped: stdlib, third-party, local
-- Config via environment variables loaded through Pydantic Settings in each service's `app/core/config.py`
+- Config via Pydantic Settings in each service's `app/core/config.py`, loaded from `.env`
 - All database access is async (asyncpg + SQLAlchemy async sessions)
-- API pagination pattern: `page`, `size` params → response with `total`, `total_pages`
+- API pagination: `page`, `size` params → response with `total`, `total_pages`
 - Auth: JWT Bearer tokens with role-based access control
-- fe-react-smo: JavaScript (ES6+), functional components + hooks, Tailwind CSS utilities, API calls centralized in `src/services/`
+- fe-react-smo: JavaScript (ES6+), functional components + hooks, Tailwind CSS, API calls in `src/services/`
 
 ## Technical Gotchas
 
 - pgvector returns numpy float32 — always convert with `[float(x) for x in vec]`
 - asyncpg doesn't support `::vector` cast — use `CAST(:param AS vector)` instead
 - OpenAI batch embedding limit ~300K tokens — `EMBEDDING_BATCH_SIZE=256` works safely
+- Cloud Run requires `--no-cpu-throttling` — Python imports take 30s+ with throttled CPU on cold start
+- Submodule URLs in `.gitmodules` must be HTTPS (not SSH) for CI/CD token auth to work
+- Client role is restricted to `/api/v1/auth/` and `/api/v1/talent-hub/` endpoints only (enforced in middleware)
 
 ## Environment Variables
 
-**be-fastapi-smo**: `DATABASE_URL` (postgresql+asyncpg://...), plus optional `OPENAI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, `APIFY_API_TOKEN`
+**be-fastapi-smo**: `DATABASE_URL` (required, `postgresql+asyncpg://...`), `OPENAI_API_KEY`, `APIFY_API_TOKEN`, `MAILGUN_API_KEY`, `MAILGUN_DOMAIN`, `GOOGLE_DRIVE_CREDENTIALS_JSON`, `SHARED_DRIVE_ID`, `ENABLE_SEMANTIC_SEARCH`, `FRONTEND_URL`, `AUTO_MATCHING_SERVICE_URL`
 
-**fe-react-smo**: `.env` with API endpoint configuration
+**auto-matching-service**: `DATABASE_URL` (required), `OPENAI_API_KEY` (required), `CEREBRAS_API_KEY` (required), `REDIS_URL` (optional, falls back to DB-only cache)
 
-**matching-service/backend**: `DATABASE_URL`, `CEREBRAS_API_KEY`, `FRONTEND_URL`
+## Deployment
 
-**matching-service/frontend**: `NEXT_PUBLIC_API_URL`
-
-**auto-matching-service**: `DATABASE_URL`, `OPENAI_API_KEY`, `CEREBRAS_API_KEY`, optional `REDIS_URL` (falls back to DB-only cache). Tunable: `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `EMBEDDING_BATCH_SIZE`, `CEREBRAS_MODEL`, `LLM_CONCURRENCY_LIMIT`, `DEFAULT_TOP_N`, `SEMANTIC_TOP_K`, `LLM_TOP_N`, `MATCH_CACHE_TTL_HOURS`, `LLM_CACHE_TTL_HOURS`, `JOB_RECENCY_DAYS`, `WEIGHT_SEMANTIC`, `WEIGHT_LLM`
+- **Production**: App Engine — `gcloud app deploy` in each service directory
+- **Test**: Cloud Run — push to `main` triggers CI/CD (`.github/workflows/deploy-cloud-run.yml`)
+- **Test URL**: `https://smo-test-seek2wfd4q-el.a.run.app`
+- **GCP project**: `student-marketing-operations`
+- **Database**: Cloud SQL instance `student-marketing-operations:asia-south1:smo`, databases `smo` (prod) and `smo_test` (test)
+- **Secrets**: GCP Secret Manager (`smo-openai-api-key`, `smo-cerebras-api-key`, `smo-apify-api-token`, `smo-gdrive-service-account`)
+- **Mailgun intentionally omitted** from test env to prevent sending real emails
